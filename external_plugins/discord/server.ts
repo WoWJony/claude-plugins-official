@@ -25,19 +25,102 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  REST,
+  Routes,
   type Message,
   type Attachment,
   type Interaction,
+  type ChatInputCommandInteraction,
 } from 'discord.js'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFile } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join, sep, basename } from 'path'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
+
+// ---------------------------------------------------------------------------
+// Supervisor pre-filter — sentinel-based remote reset/recover.
+// The target bot's claude instance must NOT be involved in the restart path:
+// zero tokens, deterministic, no prompt engineering required.
+// ---------------------------------------------------------------------------
+
+const SUPERVISOR_STATE_DIR = process.env.DISCORD_STATE_DIR ?? null
+const AUDIT_LOG = join(homedir(), '.claude', 'channels', 'audit.log')
+
+// Trigger map: normalized text → { event, sentinel filename, reply text }
+const SUPERVISOR_TRIGGERS: Record<string, { event: 'reset' | 'recover'; sentinel: string; reply: string }> = {
+  '\u{1F504}\u{1F504}\u{1F504}': { event: 'reset',   sentinel: '.restart_requested', reply: '♻️ 重启中，上下文将清空' },
+  '⚙️⚙️⚙️': { event: 'recover', sentinel: '.recover_requested',  reply: '⚙️ 重连中，上下文保留' },
+}
+
+/** Derive a short bot name from the state dir path (discord-X → X, discord → default). */
+function botNameFromStateDir(dir: string): string {
+  const base = basename(dir)
+  if (base === 'discord') return 'default'
+  const m = base.match(/^discord-(.+)$/)
+  return m ? m[1] : base
+}
+
+/** Append one TSV line to the audit log. Failures are non-fatal (console.error only). */
+function writeAuditLog(
+  event: 'reset' | 'recover',
+  stateDir: string,
+  source: 'emoji' | 'slash',
+  note = '',
+): void {
+  const ts = new Date().toISOString()
+  const bot = botNameFromStateDir(stateDir)
+  const line = `${ts}\tplugin\t${event}\t${bot}\t${source}\t${note}\n`
+  appendFile(AUDIT_LOG, line, err => {
+    if (err) process.stderr.write(`discord channel: audit log write failed: ${err}\n`)
+  })
+}
+
+/**
+ * Write a supervisor sentinel atomically (tmp + rename) so the supervisor
+ * never reads a partially-written file.
+ * Returns null on success, or an error message on failure.
+ */
+function writeSentinel(stateDir: string, name: string): string | null {
+  const target = join(stateDir, name)
+  const tmp = target + '.tmp'
+  try {
+    writeFileSync(tmp, new Date().toISOString(), { mode: 0o600 })
+    renameSync(tmp, target)
+    return null
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
+}
+
+/**
+ * Handle a supervisor trigger (reset/recover) from either emoji message or slash command.
+ * Returns true if a trigger was matched and handled (caller must return without calling mcp.notification).
+ */
+async function handleSupervisorTrigger(
+  normalizedText: string,
+  source: 'emoji' | 'slash',
+  reply: (text: string) => Promise<void>,
+): Promise<boolean> {
+  if (!SUPERVISOR_STATE_DIR) return false
+  const trigger = SUPERVISOR_TRIGGERS[normalizedText]
+  if (!trigger) return false
+
+  const errMsg = writeSentinel(SUPERVISOR_STATE_DIR, trigger.sentinel)
+  if (errMsg) {
+    await reply(`❌ supervisor sentinel write failed: ${errMsg}`)
+    writeAuditLog(trigger.event, SUPERVISOR_STATE_DIR, source, errMsg)
+    return true
+  }
+
+  writeAuditLog(trigger.event, SUPERVISOR_STATE_DIR, source)
+  await reply(trigger.reply)
+  return true
+}
 
 // Load ~/.claude/channels/discord/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where the token lives.
@@ -848,6 +931,21 @@ async function handleInbound(msg: Message): Promise<void> {
     return
   }
 
+  // Supervisor pre-filter: handle reset/recover triggers at the plugin layer.
+  // The target bot's claude instance is intentionally excluded from this path —
+  // zero tokens, deterministic, no prompt engineering required.
+  if (SUPERVISOR_STATE_DIR) {
+    const normalized = msg.content.replace(/\s+/g, '')
+    const handled = await handleSupervisorTrigger(
+      normalized,
+      'emoji',
+      text => msg.reply(text).then(() => {}).catch(err => {
+        process.stderr.write(`discord channel: supervisor reply failed: ${err}\n`)
+      }),
+    )
+    if (handled) return
+  }
+
   // Typing indicator — signals "processing" until we reply (or ~10s elapses).
   if ('sendTyping' in msg.channel) {
     void msg.channel.sendTyping().catch(() => {})
@@ -890,8 +988,55 @@ async function handleInbound(msg: Message): Promise<void> {
   })
 }
 
-client.once('ready', c => {
+client.once('ready', async c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
+
+  // Register /clear and /recover slash commands only when running under supervisor.
+  // Without DISCORD_STATE_DIR these commands would write sentinels nobody reads.
+  if (SUPERVISOR_STATE_DIR && TOKEN) {
+    const commands = [
+      { name: 'clear',   description: '重启 Bot — 清空上下文（等同于 🔄🔄🔄）' },
+      { name: 'recover', description: '重连 Bot — 保留上下文（等同于 ⚙️⚙️⚙️）' },
+    ]
+    try {
+      const rest = new REST({ version: '10' }).setToken(TOKEN)
+      await rest.put(Routes.applicationCommands(c.user.id), { body: commands })
+      process.stderr.write('discord channel: supervisor slash commands registered (/clear, /recover)\n')
+    } catch (err) {
+      process.stderr.write(`discord channel: slash command registration failed: ${err}\n`)
+    }
+  }
+})
+
+// Slash-command handler for /clear and /recover (supervisor mode only).
+client.on('interactionCreate', async (interaction: Interaction) => {
+  if (!interaction.isChatInputCommand()) return
+  const cmd = interaction as ChatInputCommandInteraction
+  if (cmd.commandName !== 'clear' && cmd.commandName !== 'recover') return
+  if (!SUPERVISOR_STATE_DIR) {
+    await cmd.reply({ content: '❌ supervisor mode not active (DISCORD_STATE_DIR not set)', ephemeral: true }).catch(() => {})
+    return
+  }
+
+  // Access check — only allowlisted users may trigger supervisor actions.
+  const access = loadAccess()
+  if (!access.allowFrom.includes(cmd.user.id)) {
+    await cmd.reply({ content: '❌ Not authorized.', ephemeral: true }).catch(() => {})
+    return
+  }
+
+  const triggerKey = cmd.commandName === 'clear' ? '\u{1F504}\u{1F504}\u{1F504}' : '⚙️⚙️⚙️'
+  await cmd.deferReply().catch(() => {})
+  const handled = await handleSupervisorTrigger(
+    triggerKey,
+    'slash',
+    async text => {
+      await cmd.editReply(text).catch(() => {})
+    },
+  )
+  if (!handled) {
+    await cmd.editReply('❌ unknown supervisor command').catch(() => {})
+  }
 })
 
 client.login(TOKEN).catch(err => {
