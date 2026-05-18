@@ -33,6 +33,13 @@ on:
 permissions:
   contents: read
 
+# Serialize scans per ref so concurrent runs (a re-dispatch racing the
+# original, or a manual dispatch) don't both restore the same cache, scan
+# overlapping sets, and lose one another's verdicts on save.
+concurrency:
+  group: scan-plugins-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 env:
   MARKETPLACE: .claude-plugin/marketplace.json
   CACHE_DIR: ${{ github.workspace }}/.scan-cache
@@ -93,7 +100,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .scan-cache
-          key: scan-verdicts-${{ hashFiles('.github/policy/**') }}-${{ github.run_id }}
+          # run_attempt so a re-run can save its own verdicts (cache keys are
+          # immutable; without it a re-run would silently fail to save).
+          key: scan-verdicts-${{ hashFiles('.github/policy/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             scan-verdicts-${{ hashFiles('.github/policy/**') }}-
 
@@ -145,13 +154,16 @@ jobs:
 
           changed_count="$(jq 'length' "$CACHE_DIR/changed.json")"
 
-          # Split changed entries into cached vs uncached.
+          # Split changed entries into cached vs uncached. A hit requires the
+          # *whole* source object (repo, sha, path, ref) to match the cached
+          # entry, not just name@sha — a repo migration or path change with the
+          # same SHA is different scan content and must miss the cache.
           jq -c -s \
             '.[0] as $cache
              | (.[1] | map(. + {key: (.name + "@" + (.source.sha // "")) })) as $entries
              | {
-                 to_scan:  [$entries[] | select(($cache[.key] // null) == null)],
-                 cached:   [$entries[] | select(($cache[.key] // null) != null)
+                 to_scan:  [$entries[] | select(($cache[.key].source // null) != .source)],
+                 cached:   [$entries[] | select(($cache[.key].source // null) == .source)
                             | . + {verdict: $cache[.key]}]
                }' \
             "$CACHE_DIR/verdicts.json" "$CACHE_DIR/changed.json" > "$CACHE_DIR/split.json"
@@ -228,26 +240,42 @@ jobs:
             echo '[]' > "$CACHE_DIR/scanned-raw.json"
           fi
 
+          # Defense in depth: the scan action runs Claude with Read access over
+          # a cloned external repo and ANTHROPIC_API_KEY in its process env. A
+          # successful prompt injection could coerce the model to put key
+          # material into `summary`/`violations`. The action's own step summary
+          # already carries that risk; this workflow adds an artifact and a PR
+          # comment, both public sinks. Scrub any key-shaped token here so it
+          # never reaches the cache, artifact, or comment.
+          jq -c '(.. | strings) |= gsub("sk-ant-[A-Za-z0-9_-]{8,}"; "[REDACTED]")' \
+            "$CACHE_DIR/scanned-raw.json" > "$CACHE_DIR/scanned-raw.json.tmp"
+          mv "$CACHE_DIR/scanned-raw.json.tmp" "$CACHE_DIR/scanned-raw.json"
+
           now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # The action's `scanned` output has no SHA — join it with the change
-          # set by name to recover the SHA for the cache key.
+          # The action's `scanned` output has no SHA or source — join it with
+          # the change set by name to recover both for the cache key + the
+          # source-equality lookup guard.
           jq -c -s --arg now "$now" \
             '.[0] as $changed
              | (.[1] // []) as $scanned
-             | ($changed | map({(.name): .source.sha}) | add // {}) as $shas
-             | [$scanned[] | . + {sha: ($shas[.name] // ""), scanned_at: $now}]' \
+             | ($changed | map({(.name): .source}) | add // {}) as $srcs
+             | [$scanned[]
+                | . + {source: ($srcs[.name] // null), sha: ($srcs[.name].sha // ""), scanned_at: $now}]' \
             "$CACHE_DIR/changed.json" "$CACHE_DIR/scanned-raw.json" \
             > "$CACHE_DIR/fresh.json"
 
-          # Merge fresh verdicts into the cache, keyed by name@sha. Existing
-          # entries are preserved; new entries are added or overwrite stale
-          # ones for the same key (a re-scan after a flaky verdict).
+          # Merge fresh verdicts into the cache, keyed by name@sha. The
+          # full source object is stored so a future repo/path change with the
+          # same SHA fails the lookup guard. summary/violations are model
+          # output — truncate to bound cache size (the artifact carries the
+          # full text for the run that produced it).
           jq -c -s \
             '.[0] + ([.[1][] | select(.sha != "") | {(.name + "@" + .sha): {
+                source: .source,
                 passes: .passes,
-                summary: (.summary // ""),
-                violations: (.violations // ""),
+                summary: ((.summary // "") | .[0:300]),
+                violations: ((.violations // "") | .[0:500]),
                 scanned_at: .scanned_at
               }}] | add // {})' \
             "$CACHE_DIR/verdicts.json" "$CACHE_DIR/fresh.json" \
@@ -280,6 +308,12 @@ jobs:
             echo "total=$total"
           } >> "$GITHUB_OUTPUT"
 
+          # `summary` and `violations` are model-generated text shaped by a
+          # cloned external repo. Strip markdown control characters AND wrap
+          # in code spans before they hit a publicly-rendered sink — code
+          # spans neutralize auto-linked bare URLs that a prompt-injected
+          # upstream could smuggle in. Stripping backticks first stops a
+          # breakout from the code span.
           {
             echo "## Policy scan (with verdict cache)"
             echo
@@ -288,13 +322,15 @@ jobs:
             if [[ "$total" -gt 0 ]]; then
               echo "| Plugin | SHA | Passes | Source | Summary |"
               echo "|---|---|---|---|---|"
-              jq -r '.[] | "| \(.name) | `\(.sha[0:8])` | \(if .passes then "✅" else "❌" end) | \(.source) | \(.summary | .[0:120]) |"' \
+              jq -r 'def neutralize: gsub("[|\n\r\\[\\]<>`]"; " ");
+                .[] | "| \(.name) | `\(.sha[0:8])` | \(if .passes then "✅" else "❌" end) | \(.source) | `\(.summary | neutralize | .[0:120])` |"' \
                 "$CACHE_DIR/run-verdicts.json"
             fi
             if [[ "$fail_count" -gt 0 ]]; then
               echo
               echo "### Violations"
-              jq -r '.[] | select(.passes == false) | "- **\(.name)** — \(.violations)"' "$CACHE_DIR/run-verdicts.json"
+              jq -r 'def neutralize: gsub("[|\n\r\\[\\]<>`]"; " ");
+                .[] | select(.passes == false) | "- **\(.name)** — `\(.violations | neutralize | .[0:500])`"' "$CACHE_DIR/run-verdicts.json"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -318,7 +354,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .scan-cache
-          key: scan-verdicts-${{ hashFiles('.github/policy/**') }}-${{ github.run_id }}
+          key: scan-verdicts-${{ hashFiles('.github/policy/**') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Required-check gate. Fails on either fresh or cached policy failures —
       # a known-bad SHA must keep failing until it is reverted or upstream

@@ -58,7 +58,12 @@ jobs:
       # run-verdicts.json (full per-entry verdicts for the PR comment). It is
       # uploaded by scan-plugins.yml for every relevant run so we can tell
       # "policy failures found" from "scan never ran" (infra error → no revert).
+      # The artifact won't exist when the scan died before the upload step
+      # (cache restore error, jq failure, timeout) — that is an infra error,
+      # not a policy failure, so the right move is to do nothing. The
+      # download must not fail the job; the next step handles the missing file.
       - name: Download scan verdicts
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: scan-verdicts
@@ -103,30 +108,39 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          pr_number="$(gh pr list --repo "$REPO" --head "$BUMP_BRANCH" --base main --state open \
-            --json number -q '.[0].number // empty')"
-          if [[ -z "$pr_number" ]]; then
+          # Resolve the bump PR by head ref. `gh pr list --head <ref>` matches
+          # by ref name across forks, so reject any PR whose head repo isn't
+          # ours — a fork PR named bump/plugin-shas must never reach the
+          # contents:write paths below.
+          pr_json="$(gh api "repos/$REPO/pulls?head=${REPO%%/*}:$BUMP_BRANCH&base=main&state=open&per_page=1" \
+            --jq '.[0] // empty')"
+          if [[ -z "$pr_json" ]]; then
             echo "::warning::No open bump PR on $BUMP_BRANCH — nothing to revert."
             echo "act=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Loop bound: count this workflow's marker comments on the PR. The
-          # bump action force-resets the branch every night and edits the
-          # existing PR (comments survive), so the budget is scoped per night
-          # by only counting comments newer than the most recent commit that
-          # was NOT created by this workflow — i.e. the nightly bump commit.
-          head_sha="$(gh api "repos/$REPO/pulls/$pr_number" --jq '.head.sha')"
-          head_date="$(gh api "repos/$REPO/commits/$head_sha" --jq '.commit.author.date')"
-          passes="$(gh api "repos/$REPO/issues/$pr_number/comments" --paginate \
-            --jq "[.[] | select(.body | startswith(\"$REVERT_MARKER\")) | select(.created_at > \"$head_date\")] | length")"
-          echo "Revert passes since last bump commit ($head_sha @ $head_date): $passes"
-          if [[ "$passes" -ge "$MAX_REVERT_PASSES" ]]; then
-            echo "::error::Revert budget exhausted ($passes/$MAX_REVERT_PASSES passes since last bump). The cache or scan is likely broken — needs a human."
-            gh pr comment "$pr_number" --repo "$REPO" --body \
-              "$REVERT_MARKER"$'\n\n'"⚠️ Revert budget exhausted ($passes passes). The scan keeps failing after reverting — likely a cache or scan bug. Pausing automatic reverts until the next nightly bump."
+          pr_number="$(jq -r '.number' <<<"$pr_json")"
+          head_repo="$(jq -r '.head.repo.full_name' <<<"$pr_json")"
+          head_sha="$(jq -r '.head.sha' <<<"$pr_json")"
+          # The list endpoint omits `commits`; the single-PR endpoint has it.
+          commit_count="$(gh api "repos/$REPO/pulls/$pr_number" --jq '.commits')"
+          if [[ "$head_repo" != "$REPO" ]]; then
+            echo "::error::Bump PR head is from $head_repo, not $REPO — refusing to act."
             echo "act=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Loop bound: every nightly bump force-resets the branch to a single
+          # commit and every revert pass adds exactly one. Counting commits is
+          # therefore the per-night pass count + 1, with no date math, no
+          # pagination, and no exposure to comment spoofing.
+          if [[ "$commit_count" -gt $(( MAX_REVERT_PASSES + 1 )) ]]; then
+            echo "::error::Revert budget exhausted ($((commit_count - 1))/$MAX_REVERT_PASSES passes on this PR). The cache or scan is likely broken — needs a human."
+            gh pr comment "$pr_number" --repo "$REPO" --body \
+              "$REVERT_MARKER"$'\n\n'"⚠️ Revert budget exhausted ($((commit_count - 1)) passes). The scan keeps failing after reverting — likely a cache or scan bug. Pausing automatic reverts until the next nightly bump."
+            echo "act=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Bump PR #$pr_number @ $head_sha ($commit_count commit(s))"
           {
             echo "act=true"
             echo "number=$pr_number"
@@ -249,10 +263,14 @@ jobs:
             echo
             echo "| Plugin | Violations |"
             echo "|---|---|"
-            # Pipes and newlines would break the markdown table; strip both.
+            # `violations` is model-generated text shaped by a cloned external
+            # repo. Strip markdown control characters and wrap in a code span
+            # so a prompt-injected upstream can't smuggle links/images/table
+            # breakouts into a public PR comment.
             jq -r --argjson rev "$REVERTED" \
-              '.[] | select(.name as $n | $rev | index($n))
-               | "| \(.name) | \(.violations | gsub("[|\n\r]"; " ") | .[0:200]) |"' \
+              'def neutralize: gsub("[|\n\r\\[\\]<>`]"; " ");
+               .[] | select(.name as $n | $rev | index($n))
+               | "| \(.name) | `\(.violations | neutralize | .[0:200])` |"' \
               scan-out/run-verdicts.json
             echo
             echo "These entries will be retried at their next upstream SHA. See the [scan run]($SCAN_RUN_URL) for full verdicts."
