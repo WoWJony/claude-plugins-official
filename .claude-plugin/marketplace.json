@@ -753,7 +753,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/get-convex/convex-backend-skill.git",
-        "sha": "59663a59be20c05911157116464f1be603ab70cc"
+        "sha": "5e59870cda2a5892e18a7164d1a46fcf57b70bea"
       },
       "homepage": "https://github.com/get-convex/convex-backend-skill",
       "keywords": [
