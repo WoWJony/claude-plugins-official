@@ -27,7 +27,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import extensibility
 import review_api
-from _base import debug_log, _record_usage, _PV, PROVENANCE_TAG  # noqa: F401
+from _base import debug_log, _record_usage, _PV, PROVENANCE_TAG, state_dir as _resolve_state_dir  # noqa: F401
 from session_state import with_locked_state
 
 
@@ -355,10 +355,7 @@ def _call_claude_via_sdk(prompt, output_schema, *, max_tokens=16000, model=None)
         # Try the venv ensure_agent_sdk.py builds. Same fallback logic as
         # agentic_review() — duplicated here so the 3P path doesn't require
         # the agentic path to have run first.
-        _state_dir = os.environ.get(
-            "SECURITY_WARNINGS_STATE_DIR",
-            os.path.expanduser("~/.claude/security"),
-        )
+        _state_dir = _resolve_state_dir()
         _inject_agent_sdk_venv_into_syspath(_state_dir)
         try:
             import asyncio as _asyncio  # noqa: F811
@@ -1145,10 +1142,7 @@ def agentic_review(
         # ~/.claude/security/ with the SDK installed; try that as a fallback
         # before giving up. The system import is attempted first so users
         # who DO have it never touch the venv.
-        _state_dir = os.environ.get(
-            "SECURITY_WARNINGS_STATE_DIR",
-            os.path.expanduser("~/.claude/security"),
-        )
+        _state_dir = _resolve_state_dir()
         _venv_tried = _inject_agent_sdk_venv_into_syspath(_state_dir)
         try:
             import asyncio as _asyncio  # noqa: F811

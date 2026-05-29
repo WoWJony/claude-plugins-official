@@ -23,6 +23,12 @@ import sys
 import time
 from pathlib import Path
 
+# Shared state-dir resolver: SECURITY_WARNINGS_STATE_DIR → CLAUDE_CONFIG_DIR/security
+# → ~/.claude/security. See _base.state_dir for resolution precedence. Re-aliased
+# here to match the existing local name (state_dir was already a local var in
+# main() and _maybe_emit_user_notice).
+from _base import state_dir as _resolve_state_dir
+
 # Outcome codes for the sdk_bootstrap metric. Values are stable for telemetry.
 NOOP_SYSTEM = 0      # claude_agent_sdk already importable in system python
 NOOP_VENV = 1        # venv already built and SDK imports from it
@@ -90,10 +96,7 @@ def main() -> tuple[int, str, str]:
     if _sdk_on_syspath():
         return NOOP_SYSTEM, "", ""
 
-    state_dir = Path(
-        os.environ.get("SECURITY_WARNINGS_STATE_DIR")
-        or os.path.expanduser("~/.claude/security")
-    )
+    state_dir = Path(_resolve_state_dir())
     venv = state_dir / "agent-sdk-venv"
     # Windows venvs put the interpreter at Scripts\python.exe; POSIX uses bin/python.
     if sys.platform == "win32":
@@ -239,10 +242,7 @@ def _maybe_emit_user_notice(outcome: int, pv: int) -> str | None:
     if outcome != HOOK_PY_INCOMPATIBLE:
         return None
     try:
-        state_dir = Path(
-            os.environ.get("SECURITY_WARNINGS_STATE_DIR")
-            or os.path.expanduser("~/.claude/security")
-        )
+        state_dir = Path(_resolve_state_dir())
         marker = state_dir / f".agentic_unavailable_notice_v{pv or 0}"
         if marker.exists():
             return None

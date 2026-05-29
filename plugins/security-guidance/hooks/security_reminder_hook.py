@@ -82,6 +82,7 @@ from _base import (  # noqa: E402,F401
     PROVENANCE_TAG, PROVENANCE_BANNER,
     _read_plugin_version_int, _PV, _USAGE, _USAGE_LOCK,
     _PRICE_PER_MTOK, _PRICE_DEFAULT, _record_usage, _usage_metrics,
+    state_dir as _resolve_state_dir,
 )
 import extensibility  # noqa: E402
 from patterns import (  # noqa: E402,F401
@@ -1971,10 +1972,7 @@ def handle_stop_hook(input_data):
     })
     sys.exit(0)
 
-_SDK_BOOTSTRAP_THROTTLE = os.path.join(
-    os.environ.get("SECURITY_WARNINGS_STATE_DIR")
-    or os.path.expanduser("~/.claude/security"),
-    ".sdk_bootstrap_spawned")
+_SDK_BOOTSTRAP_THROTTLE = os.path.join(_resolve_state_dir(), ".sdk_bootstrap_spawned")
 
 def _maybe_bootstrap_agent_sdk_async():
     """Fire-and-forget SDK bootstrap, for remote-pod environments.
