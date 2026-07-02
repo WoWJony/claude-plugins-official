@@ -97,6 +97,40 @@ function writeSentinel(stateDir: string, name: string): string | null {
   }
 }
 
+// Watchdog stamp files (names mirror protocol/consts.sh in the supervisor
+// repo). .last_inbound is touched when a message is delivered to claude,
+// .last_reply when a reply/edit_message lands — the supervisor compares their
+// mtimes to detect "alive but silent" stalls; /status surfaces them too.
+const LAST_INBOUND_STAMP = '.last_inbound'
+const LAST_REPLY_STAMP = '.last_reply'
+
+function stampStateFile(name: string): void {
+  if (!SUPERVISOR_STATE_DIR) return
+  try {
+    writeFileSync(join(SUPERVISOR_STATE_DIR, name), new Date().toISOString(), { mode: 0o600 })
+  } catch {}
+}
+
+// Per-chat latest inbound awaiting a reply, so the reply tool can swap the
+// ack reaction (👀 → ✅) on the message that started the work. Bounded by the
+// number of active channels.
+const lastInboundByChat = new Map<string, { msg: Message; ack: string }>()
+
+/** Swap the ack reaction to ✅ on the inbound message this reply answers. */
+function markInboundAnswered(chatId: string): void {
+  const entry = lastInboundByChat.get(chatId)
+  if (!entry) return
+  lastInboundByChat.delete(chatId)
+  void (async () => {
+    try {
+      if (entry.ack && client.user) {
+        await entry.msg.reactions.resolve(entry.ack)?.users.remove(client.user.id)
+      }
+      await entry.msg.react('✅')
+    } catch {} // cosmetic — never let reaction failures break the reply path
+  })()
+}
+
 /**
  * Handle a supervisor trigger (reset/recover) from either emoji message or slash command.
  * Returns true if a trigger was matched and handled (caller must return without calling mcp.notification).
@@ -731,6 +765,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`)
         }
 
+        stampStateFile(LAST_REPLY_STAMP)
+        markInboundAnswered(chat_id)
+
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -770,6 +807,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const ch = await fetchAllowedChannel(args.chat_id as string)
         const msg = await ch.messages.fetch(args.message_id as string)
         const edited = await msg.edit(args.text as string)
+        stampStateFile(LAST_REPLY_STAMP)
         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
       }
       case 'download_attachment': {
@@ -952,10 +990,15 @@ async function handleInbound(msg: Message): Promise<void> {
   }
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
+  // Under supervisor mode this defaults to 👀 (access.json can override, or
+  // set "" to disable); the reply tool swaps it to ✅ once a reply lands.
   const access = result.access
-  if (access.ackReaction) {
-    void msg.react(access.ackReaction).catch(() => {})
+  const ackEmoji = access.ackReaction ?? (SUPERVISOR_STATE_DIR ? '👀' : '')
+  if (ackEmoji) {
+    void msg.react(ackEmoji).catch(() => {})
   }
+  lastInboundByChat.set(chat_id, { msg, ack: ackEmoji })
+  stampStateFile(LAST_INBOUND_STAMP)
 
   // Attachments are listed (name/type/size) but not downloaded — the model
   // calls download_attachment when it wants them. Keeps the notification
@@ -997,6 +1040,7 @@ client.once('ready', async c => {
     const commands = [
       { name: 'clear',   description: '重启 Bot — 清空上下文（等同于 🔄🔄🔄）' },
       { name: 'recover', description: '重连 Bot — 保留上下文（等同于 ⚙️⚙️⚙️）' },
+      { name: 'status',  description: '查看 Bot 状态 — supervisor 心跳 / 会话 / 收发时间（零 token）' },
     ]
     try {
       const rest = new REST({ version: '10' }).setToken(TOKEN)
@@ -1008,11 +1052,58 @@ client.once('ready', async c => {
   }
 })
 
-// Slash-command handler for /clear and /recover (supervisor mode only).
+function agoStr(epochMs: number): string {
+  if (!epochMs || !Number.isFinite(epochMs)) return '无记录'
+  const s = Math.max(0, Math.floor((Date.now() - epochMs) / 1000))
+  if (s < 60) return `${s} 秒前`
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
+  return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分前`
+}
+
+// Zero-token status report: everything comes from local files + pid checks,
+// the claude session is never woken. If this code runs at all, claude itself
+// is alive — the MCP server dies with its parent — so uptime ≈ session age.
+function buildStatusReport(): string {
+  const stateDir = SUPERVISOR_STATE_DIR!
+  const lines: string[] = [`📊 **${botNameFromStateDir(stateDir)}** 状态`]
+
+  const up = Math.floor(process.uptime())
+  lines.push(`claude 会话：🟢 运行中（已启动 ${Math.floor(up / 3600)}h${Math.floor((up % 3600) / 60)}m）`)
+
+  try {
+    const reg = JSON.parse(readFileSync(join(homedir(), '.claude', 'channels', 'registry.json'), 'utf8'))
+    const entry = reg?.bots?.[botNameFromStateDir(stateDir)]
+    if (entry) {
+      let alive = false
+      try { process.kill(entry.supervisor_pid, 0); alive = true } catch {}
+      const hb = Date.parse(entry.registered_at)
+      const stale = Number.isFinite(hb) && Date.now() - hb > 5 * 60 * 1000
+      lines.push(
+        `supervisor：${alive && !stale ? '🟢' : '🔴'} pid ${entry.supervisor_pid}` +
+        `${alive ? '' : '（进程不存在）'} · 心跳 ${agoStr(hb)}${stale ? ' ⚠️ 已过期' : ''}`,
+      )
+    } else {
+      lines.push('supervisor：🔴 未注册（registry.json 无此 bot）')
+    }
+  } catch {
+    lines.push('supervisor：❓ registry.json 读取失败')
+  }
+
+  const mtime = (name: string): number => {
+    try { return statSync(join(stateDir, name)).mtimeMs } catch { return 0 }
+  }
+  const inboundAt = mtime(LAST_INBOUND_STAMP)
+  const replyAt = mtime(LAST_REPLY_STAMP)
+  lines.push(`最后收到：${agoStr(inboundAt)} · 最后回复：${agoStr(replyAt)}`)
+  if (inboundAt > replyAt) lines.push('⏳ 有消息正在处理中')
+  return lines.join('\n')
+}
+
+// Slash-command handler for /clear, /recover and /status (supervisor mode only).
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isChatInputCommand()) return
   const cmd = interaction as ChatInputCommandInteraction
-  if (cmd.commandName !== 'clear' && cmd.commandName !== 'recover') return
+  if (cmd.commandName !== 'clear' && cmd.commandName !== 'recover' && cmd.commandName !== 'status') return
   if (!SUPERVISOR_STATE_DIR) {
     await cmd.reply({ content: '❌ supervisor mode not active (DISCORD_STATE_DIR not set)', ephemeral: true }).catch(() => {})
     return
@@ -1022,6 +1113,11 @@ client.on('interactionCreate', async (interaction: Interaction) => {
   const access = loadAccess()
   if (!access.allowFrom.includes(cmd.user.id)) {
     await cmd.reply({ content: '❌ Not authorized.', ephemeral: true }).catch(() => {})
+    return
+  }
+
+  if (cmd.commandName === 'status') {
+    await cmd.reply({ content: buildStatusReport(), ephemeral: true }).catch(() => {})
     return
   }
 
