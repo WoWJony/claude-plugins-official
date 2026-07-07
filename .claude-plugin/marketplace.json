@@ -966,7 +966,7 @@
         "url": "https://github.com/awslabs/agent-plugins.git",
         "path": "plugins/databases-on-aws",
         "ref": "main",
-        "sha": "7a17df718d26f07414b876e77a7480fa25089b08"
+        "sha": "23dc619d35f848fd03b12d45d0e16c191d40d1e6"
       },
       "homepage": "https://github.com/awslabs/agent-plugins"
     },
