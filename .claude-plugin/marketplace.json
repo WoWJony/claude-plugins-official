@@ -1333,7 +1333,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/huggingface/skills.git",
-        "sha": "c68f1b08d9eb3af22cdc1d3fb60e9cdb78522556"
+        "sha": "89d91fd4d0e6d4330471ba35f1c388489e94b496"
       },
       "homepage": "https://github.com/huggingface/skills.git"
     },
