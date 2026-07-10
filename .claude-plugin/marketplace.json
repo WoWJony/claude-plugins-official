@@ -2801,7 +2801,7 @@
         "url": "https://github.com/UI5/plugins-coding-agents.git",
         "path": "plugins/ui5-typescript-conversion",
         "ref": "main",
-        "sha": "80f2d93287054f9d30dd990e842e15bcfca581c9"
+        "sha": "7f70fc8c680b35de617d141146b7ca7c96c4a2a1"
       },
       "homepage": "https://github.com/UI5/plugins-coding-agents"
     },
